@@ -1,0 +1,104 @@
+--- a/exl3_plain_sglang_overlay/loader.py
++++ b/exl3_plain_sglang_overlay/loader.py
+@@ -18,11 +18,17 @@
+ Any trellis tensor that reaches the end unrouted aborts the load, and so does any non-EXL3 SGLang
+ parameter that received no checkpoint tensor from the stock loader (SGLang ``continue``s on names it
+ cannot match; a module left at random init is exactly the silent failure this adapter must refuse).
++The converse is gated too: every tensor handed to the stock loader must reach some parameter's
++``weight_loader`` (a checkpoint tensor SGLang drops on the floor is the same silent failure seen from the
++other side).  Patterns listed in ``EXL3_PLAIN_ALLOW_UNCONSUMED`` (comma-separated, layer index -> ``N``)
++are tolerated and reported; ``EXL3_PLAIN_STRICT_CONSUMED=0`` downgrades the abort to a warning.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
++import os
++import re
+ from collections import defaultdict
+ from typing import Iterable
+ 
+@@ -118,33 +124,80 @@
+         # loader.  SGLang's load_weights `continue`s on names it cannot map, leaving the module at random init.
+         from sglang.srt.model_loader.weight_utils import default_weight_loader
+         loaded: set[str] = set()
++        consumed: set[str] = set()          # checkpoint names whose tensor reached a weight_loader
++        current: list[str | None] = [None]  # name of the tensor the stock loader is processing right now
+ 
+         def _record(pname, param):
+             inner = getattr(param, "weight_loader", None) or default_weight_loader
+ 
+             def rec(p, *a, **k):
+                 loaded.add(pname)
++                if current[0] is not None:
++                    consumed.add(current[0])
+                 return inner(p, *a, **k)
+             param.weight_loader = rec
+             return inner
+ 
++        def _tracked(items):
++            for name, tensor in items:
++                current[0] = name
++                yield name, tensor
++            current[0] = None
++
+         originals = {pname: _record(pname, param) for pname, param in params.items() if ".exl3_" not in pname}
+         try:
+-            result = original(self, remaining, is_nextn=is_nextn)
++            result = original(self, _tracked(remaining), is_nextn=is_nextn)
+         finally:
+             for pname, inner in originals.items():
+                 params[pname].weight_loader = inner
+         missing = sorted(n for n in originals if n not in loaded)
++        unconsumed = _unconsumed(remaining, consumed)
+         log.warning("exl3_plain byte accounting (end of load)\n%s", acct.report())
+-        log.warning("exl3_plain: stock loader received %d tensors; %d/%d non-EXL3 parameters loaded, %d missing",
+-                    len(remaining), len(originals) - len(missing), len(originals), len(missing))
++        log.warning("exl3_plain: stock loader received %d tensors; %d/%d non-EXL3 parameters loaded, %d missing; "
++                    "%d checkpoint tensors reached no parameter",
++                    len(remaining), len(originals) - len(missing), len(originals), len(missing), len(unconsumed))
+         if missing:
+             raise ValueError(f"{len(missing)} SGLang parameters received no checkpoint tensor (would serve random init): "
+                              f"{missing[:40]}{' ...' if len(missing) > 40 else ''}")
++        if unconsumed:
++            allowed = {p.strip() for p in os.environ.get("EXL3_PLAIN_ALLOW_UNCONSUMED", "").split(",") if p.strip()}
++            by_pattern: dict[str, list[str]] = defaultdict(list)
++            for name in unconsumed:
++                by_pattern[_pattern(name)].append(name)
++            report = "\n".join(f"  {len(v):4d}  {k}   e.g. {v[0]}" for k, v in sorted(by_pattern.items()))
++            log.warning("exl3_plain: checkpoint tensors handed to the stock loader that reached NO parameter "
++                        "(SGLang dropped them silently):\n%s", report)
++            offending = sorted(k for k in by_pattern if k not in allowed)
++            if offending and os.environ.get("EXL3_PLAIN_STRICT_CONSUMED", "1").strip() != "0":
++                raise ValueError(f"{sum(len(by_pattern[k]) for k in offending)} checkpoint tensors were silently dropped by "
++                                 f"the stock loader (patterns: {offending[:20]}); set EXL3_PLAIN_ALLOW_UNCONSUMED to accept "
++                                 "a pattern deliberately or EXL3_PLAIN_STRICT_CONSUMED=0 to downgrade to a warning")
+         return result
+     return wrapped
+ 
+ 
++_LAYER_IDX = re.compile(r"\.(\d+)\.")
++_A_PROJ_PAIR = (".self_attn.q_a_proj.weight", ".self_attn.kv_a_proj_with_mqa.weight")
++
++
++def _pattern(name: str) -> str:
++    return _LAYER_IDX.sub(".N.", name)
++
++
++def _unconsumed(remaining, consumed: set[str]) -> list[str]:
++    """Names handed to the stock loader that never reached a weight_loader call.
++
++    SGLang caches q_a_proj / kv_a_proj_with_mqa and loads both into fused_qkv_a_proj_with_mqa when the second
++    of the pair arrives, so the first is consumed by that later call; credit it when its partner was consumed."""
++    names = [n for n, _ in remaining]
++    done = set(consumed)
++    for n in names:
++        for a, b in (_A_PROJ_PAIR, _A_PROJ_PAIR[::-1]):
++            if n.endswith(a) and n[: -len(a)] + b in done:
++                done.add(n)
++    return [n for n in names if n not in done]
++
++
+ def _quant_config(model):
+     cfg = getattr(model, "quant_config", None)
+     if cfg is None or cfg.get_name() != "exl3":

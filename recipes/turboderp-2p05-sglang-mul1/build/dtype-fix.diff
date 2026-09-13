@@ -1,0 +1,16 @@
+--- a/exl3_plain_sglang_overlay/exl3_reference.py	2026-09-13 02:46:28
+b/exl3_plain_sglang_overlay/exl3_reference.py	2026-09-13 02:46:29
+@@ -94,10 +94,10 @@
+ 
+ @lru_cache(maxsize=None)
+ def hadamard128() -> torch.Tensor:
+-    h = torch.ones(1, 1)
++    h = torch.ones(1, 1, dtype=torch.float32)
+     while h.shape[0] < 128:
+-        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+-    return h / math.sqrt(128)
++        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0).to(torch.float32)
++    return (h / math.sqrt(128)).to(torch.float32)
+ 
+ 
+ def outer_weight(inner: torch.Tensor, suh: torch.Tensor, svh: torch.Tensor) -> torch.Tensor:

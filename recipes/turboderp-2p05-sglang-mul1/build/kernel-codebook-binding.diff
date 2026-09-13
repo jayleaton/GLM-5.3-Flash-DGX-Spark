@@ -1,0 +1,38 @@
+# kernel-codebook-binding.diff — patched sparkinfer: bind trellis_codebook on W4A16FusedMoeKernel.
+#
+# Gate-2 failure (2384, attempt 5, image :serve sha256:6c0a275d, APPLY_MOE_MARKER=1):
+#   AttributeError: 'W4A16FusedMoeKernel' object has no attribute 'trellis_codebook'
+# Shards loaded and prepare_weights(trellis_mul1=<marker>) succeeded (moe-mul1-marker.diff worked);
+# the scheduler died at first run: fused_moe run -> compile W4A16FusedMoeKernel(..., trellis_codebook=)
+# -> __init__ builds self.fc1/self.fc2 = W4A16GemmKernel(..., trellis_codebook=self.trellis_codebook).
+# Cause: patches/0002-kernel-codebook-plumbing-and-2bit.diff adds the `trellis_codebook` parameter
+# to W4A16FusedMoeKernel.__init__ (kernel.py ~4608) and reads self.trellis_codebook at the two
+# W4A16GemmKernel constructions (~4749, ~4775) but never assigns it (W4A16GemmKernel got its own
+# assignment at ~807; the fused class did not).  An AST scan of the patched kernel.py shows this is
+# the only class that reads a self.trellis_* attribute it never writes.  The plan/prepare side is
+# intact: prepared.trellis_codebook is set by prepare_weights (fused_moe/_impl.py ~4889/4954) and
+# threaded by run() into compile/cache-key (kernel.py ~9838/10300/10638); no overlay change needed.
+# Fix: assign + validate self.trellis_codebook next to self.trellis_bits, before fc1/fc2 are built,
+# mirroring the W4A16GemmKernel assignment from 0002.  mcg artifacts are unaffected (default "mcg").
+#
+# Apply on top of patches/0001..0003 (the :mul1-validate site-packages tree):
+#   cd /sgl-workspace/sglang/python && patch -p1 --forward -i kernel-codebook-binding.diff
+# Dockerfile.serve does this.  patches/generate.py is NOT changed here (0002 is baked into the base
+# image); fold this assignment into patch_kernel() at the next regeneration.
+--- a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py	2026-09-13 03:04:09
++++ b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py	2026-09-13 03:04:57
+@@ -4670,6 +4670,14 @@
+         self.swiglu_beta = float(swiglu_beta)
+         self.weight_layout = weight_layout
+         self.trellis_bits = int(trellis_bits)
++        # Bind the codebook on the fused kernel before fc1/fc2 are built below:
++        # both W4A16GemmKernel constructions read self.trellis_codebook.
++        self.trellis_codebook = str(trellis_codebook).lower()
++        if self.trellis_codebook not in _TRELLIS256_CODEBOOKS:
++            raise ValueError(
++                f"trellis3_t256 codebook must be one of {_TRELLIS256_CODEBOOKS}, "
++                f"got {trellis_codebook!r}"
++            )
+         self.scale_format = scale_format
+         self.w13_layout = w13_layout
+         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)

@@ -1,0 +1,244 @@
+diff -u -r a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+--- a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py	2026-07-30 07:13:57
++++ b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py	2026-09-12 16:19:08
+@@ -127,7 +127,8 @@
+ _NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
+ # Native EXL3 t256 tiles contain 256 tail-biting codes at one compile-time
+ # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
+-_TRELLIS256_BITS = (3, 4, 5, 6)
++_TRELLIS256_BITS = (2, 3, 4, 5, 6)
++_TRELLIS256_CODEBOOKS = ("mcg", "mul1")
+ _SCALE_FORMATS = {
+     "e4m3_k16": "e4m3_k16",
+     "e8m0_k32": "e8m0_k32",
+@@ -507,6 +508,7 @@
+     w13_layout: str = "w13"
+     dense_route_fast_path: bool = False
+     trellis_bits: int = 3
++    trellis_codebook: str = "mcg"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -566,6 +568,7 @@
+     intermediate_rotation: bool = False
+     dual_a: bool = False
+     trellis_bits: int = 3
++    trellis_codebook: str = "mcg"
+     full_rotation: bool = False
+     rotation_input_dtype: str = "fp16"
+ 
+@@ -692,6 +695,7 @@
+         scale_format: str = "e4m3_k16",
+         w13_layout: str = "w13",
+         trellis_bits: int = 3,
++        trellis_codebook: str = "mcg",
+         source_n_rotation: int = 0,
+         single_token_route_fast_path: bool = False,
+         direct_topk_routes: bool = False,
+@@ -800,6 +804,12 @@
+         self.epilogue_relu2 = epilogue_activation == "relu2"
+         self.weight_layout = weight_layout
+         self.trellis_bits = trellis_bits
++        self.trellis_codebook = str(trellis_codebook).lower()
++        if self.trellis_codebook not in _TRELLIS256_CODEBOOKS:
++            raise ValueError(
++                f"trellis3_t256 codebook must be one of {_TRELLIS256_CODEBOOKS}, "
++                f"got {trellis_codebook!r}"
++            )
+         self.weight_layout_nf3 = weight_layout == "nf3_2p1"
+         self.weight_layout_trellis256 = weight_layout == "trellis3_t256"
+         self.weight_layout_trellis256_proj = (
+@@ -1007,6 +1017,7 @@
+             self.num_experts,
+             self.top_k,
+             self.mul_topk_weights,
++            self.trellis_codebook,
+             self.tile_n,
+             self.tile_k,
+             self.cta_threads,
+@@ -3033,19 +3044,19 @@
+         if cutlass.const_expr(self.trellis_bits == 6):
+             if cutlass.const_expr(self.is_fp16):
+                 o0, o1, o2, o3 = packed_dequant_trellis_stream_to_half2x4(
+-                    win_a, win_b, self.trellis_bits
++                    win_a, win_b, self.trellis_bits, self.trellis_codebook
+                 )
+             else:
+                 o0, o1, o2, o3 = packed_dequant_trellis_stream_to_bfloat2x4(
+-                    win_a, win_b, self.trellis_bits
++                    win_a, win_b, self.trellis_bits, self.trellis_codebook
+                 )
+         elif cutlass.const_expr(self.is_fp16):
+             o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
+-                win_a, win_b, self.trellis_bits
++                win_a, win_b, self.trellis_bits, self.trellis_codebook
+             )
+         else:
+             o0, o1, o2, o3 = packed_dequant_trellis_to_bfloat2x4(
+-                win_a, win_b, self.trellis_bits
++                win_a, win_b, self.trellis_bits, self.trellis_codebook
+             )
+         frag[0, 0] = o0
+         frag[0, 1] = o1
+@@ -4594,6 +4605,7 @@
+         scale_format: str = "e4m3_k16",
+         w13_layout: str = "w13",
+         trellis_bits: int = 3,
++        trellis_codebook: str = "mcg",
+         direct_topk_routes: bool = False,
+         tc_decode_fused_sum: bool = False,
+         tc_zero_output: bool = True,
+@@ -4734,6 +4746,7 @@
+             scale_format=scale_format,
+             w13_layout=w13_layout,
+             trellis_bits=self.trellis_bits,
++            trellis_codebook=self.trellis_codebook,
+             source_n_rotation=fc1_source_n_rotation,
+             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
+             direct_topk_routes=self.direct_topk_routes,
+@@ -4759,6 +4772,7 @@
+             scale_format=scale_format,
+             w13_layout=("packed" if weight_layout == "trellis3_t256" else w13_layout),
+             trellis_bits=self.trellis_bits,
++            trellis_codebook=self.trellis_codebook,
+             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
+             direct_topk_routes=self.direct_topk_routes,
+             fused_topk_sum=self.tc_decode_fused_sum,
+@@ -6871,6 +6885,7 @@
+     scale_format: str = "e4m3_k16",
+     w13_layout: str = "packed",
+     trellis_bits: int = 3,
++    trellis_codebook: str = "mcg",
+     dense_route_fast_path: bool = False,
+ ) -> W4A16GemmCompileResult:
+     scale_format = _normalize_scale_format(scale_format)
+@@ -6895,6 +6910,7 @@
+         scale_format=scale_format,
+         w13_layout=w13_layout,
+         trellis_bits=trellis_bits,
++        trellis_codebook=trellis_codebook,
+         dense_route_fast_path=bool(dense_route_fast_path),
+         schedule_whole_tiles=weight_layout == "trellis3_t256",
+     )
+@@ -7018,6 +7034,7 @@
+         w13_layout=w13_layout,
+         dense_route_fast_path=bool(dense_route_fast_path),
+         trellis_bits=int(trellis_bits),
++        trellis_codebook=str(trellis_codebook),
+     )
+     _CACHE[cache_key] = result
+     return result
+@@ -7046,6 +7063,7 @@
+     scale_format: str = "e4m3_k16",
+     w13_layout: str = "w13",
+     trellis_bits: int = 3,
++    trellis_codebook: str = "mcg",
+     direct_topk_routes: bool = False,
+     tc_decode_fused_sum: bool = False,
+     collect_activation_amax: bool = False,
+@@ -7412,6 +7430,7 @@
+         scale_format=scale_format,
+         w13_layout=w13_layout,
+         trellis_bits=trellis_bits,
++        trellis_codebook=trellis_codebook,
+         direct_topk_routes=direct_topk_routes,
+         tc_decode_fused_sum=tc_decode_fused_sum,
+         collect_activation_amax=collect_activation_amax,
+@@ -7724,6 +7743,7 @@
+         intermediate_rotation=intermediate_rotation,
+         dual_a=kernel.dual_a,
+         trellis_bits=trellis_bits,
++        trellis_codebook=trellis_codebook,
+         full_rotation=full_rotation,
+         rotation_input_dtype=rotation_input_dtype,
+     )
+@@ -8507,6 +8527,7 @@
+     intermediate_rotation: bool = False,
+     a_input_up: torch.Tensor | None = None,
+     trellis_bits: int = 3,
++    trellis_codebook: str = "mcg",
+     full_rotation: bool = False,
+     rotation_input: torch.Tensor | None = None,
+     suh_gate_table: torch.Tensor | None = None,
+@@ -8579,6 +8600,7 @@
+         scale_format=scale_format,
+         w13_layout=w13_layout,
+         trellis_bits=trellis_bits,
++        trellis_codebook=trellis_codebook,
+         direct_topk_routes=bool(direct_topk_routes),
+         tc_decode_fused_sum=bool(tc_decode_fused_sum),
+         collect_activation_amax=collect_activation_amax,
+@@ -9281,6 +9303,7 @@
+     scale_format: str = "e4m3_k16",
+     w13_layout: str = "packed",
+     trellis_bits: int = 3,
++    trellis_codebook: str = "mcg",
+     dense_route_fast_path: bool = False,
+     route_slots: int | None = None,
+     force_tile_config: tuple[int, int] | None = None,
+@@ -9336,6 +9359,7 @@
+         scale_format=scale_format,
+         w13_layout=w13_layout,
+         trellis_bits=trellis_bits,
++        trellis_codebook=trellis_codebook,
+         dense_route_fast_path=bool(dense_route_fast_path),
+     )
+     if route_slots is None:
+@@ -9483,9 +9507,10 @@
+         raise ValueError("run_trellis256_dense requires prepared trellis3_t256 weights")
+     if int(getattr(prepared_dense, "num_experts", 0)) != 1:
+         raise ValueError("run_trellis256_dense requires an honest E=1 prepared weight")
+-    if getattr(prepared_dense, "trellis_codebook", None) != "mcg":
++    trellis_codebook = str(getattr(prepared_dense, "trellis_codebook", None)).lower()
++    if trellis_codebook not in _TRELLIS256_CODEBOOKS:
+         raise NotImplementedError(
+-            "run_trellis256_dense currently decodes only the MCG codebook; "
++            f"run_trellis256_dense decodes {_TRELLIS256_CODEBOOKS}; "
+             f"got {getattr(prepared_dense, 'trellis_codebook', None)!r}"
+         )
+     trellis_bits = int(getattr(prepared_dense, "trellis_bits", 0))
+@@ -9595,6 +9620,7 @@
+         scale_format="e4m3_k32",
+         w13_layout="packed",
+         trellis_bits=trellis_bits,
++        trellis_codebook=trellis_codebook,
+         dense_route_fast_path=True,
+         route_slots=route_slots,
+         force_tile_config=(tile_k, tile_n),
+@@ -9809,15 +9835,18 @@
+     if weight_layout not in _WEIGHT_LAYOUTS:
+         raise ValueError(f"unsupported W4A16 weight_layout {weight_layout!r}")
+     trellis_bits = int(getattr(prepared, "trellis_bits", 3))
++    trellis_codebook = "mcg"
+     if weight_layout == "trellis3_t256":
+         if trellis_bits not in _TRELLIS256_BITS:
+             raise ValueError(
+                 f"prepared trellis3_t256 bitrate must be in {_TRELLIS256_BITS}, "
+                 f"got {trellis_bits}"
+             )
+-        if getattr(prepared, "trellis_codebook", None) != "mcg":
++        trellis_codebook = str(getattr(prepared, "trellis_codebook", None)).lower()
++        if trellis_codebook not in _TRELLIS256_CODEBOOKS:
+             raise NotImplementedError(
+-                "trellis3_t256 execution currently requires the MCG codebook"
++                f"trellis3_t256 execution supports codebooks {_TRELLIS256_CODEBOOKS}; "
++                f"got {getattr(prepared, 'trellis_codebook', None)!r}"
+             )
+         if activation_amax is not None:
+             raise NotImplementedError(
+@@ -10268,6 +10297,7 @@
+             scale_format=scale_format,
+             w13_layout=w13_layout,
+             trellis_bits=trellis_bits,
++            trellis_codebook=trellis_codebook,
+             direct_topk_routes=use_direct_topk_routes,
+             tc_decode_fused_sum=use_tc_decode,
+             collect_activation_amax=collect_activation_amax,
+@@ -10605,6 +10635,7 @@
+             intermediate_rotation=_intermediate_rotation,
+             a_input_up=launch_a_up,
+             trellis_bits=trellis_bits,
++            trellis_codebook=trellis_codebook,
+             full_rotation=full_rotation,
+             rotation_input=_rc_a,
+             suh_gate_table=suh_gate_table,

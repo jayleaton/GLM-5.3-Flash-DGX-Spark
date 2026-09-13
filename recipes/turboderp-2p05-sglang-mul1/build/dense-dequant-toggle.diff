@@ -1,0 +1,18 @@
+# dense-dequant-toggle.diff — BISECT EXPERIMENT ONLY (see moe-numerics-debug.md §8). Adds EXL3_PLAIN_FORCE_DENSE_DEQUANT=1.
+--- config.serve2.py	2026-09-13 04:29:42
++++ config.forcedequant.py	2026-09-13 04:29:42
+@@ -61,6 +61,14 @@
+             raise ValueError(f"quantization_config codebook={self.codebook!r} but census found {self.census['codebook']!r}")
+         # census verdict: which DENSE modules sparkinfer's kernel *could* run natively
+         self.dense_native = self.census["verdict"]["dense_sparkinfer_native"]
++        # BISECT EXPERIMENT (moe-numerics-debug.md): EXL3_PLAIN_FORCE_DENSE_DEQUANT=1 routes EVERY dense
++        # module (o_proj, q_b_proj, indexer.wq_b, down_proj, shared down_proj, lm_head, vision) through the
++        # sanctioned dequant->BF16 path instead of Exl3LinearMethod, so the native dense wiring inside
++        # SGLang can be excluded or implicated.  Not for production.
++        if os.environ.get("EXL3_PLAIN_FORCE_DENSE_DEQUANT", "").strip() == "1":
++            log.warning("exl3_plain: EXL3_PLAIN_FORCE_DENSE_DEQUANT=1 -> all %d dense modules take the dequant->BF16 path (bisect experiment)",
++                        len(self.dense_native))
++            self.dense_native = {k: False for k in self.dense_native}
+         # construction-time routing, filled by get_quant_method(); the loader keys on these,
+         # never on dense_native alone (the SGLang consumer may be fused: see get_quant_method)
+         self.native_bound: dict[str, str] = {}     # source module -> SGLang prefix holding the payload params

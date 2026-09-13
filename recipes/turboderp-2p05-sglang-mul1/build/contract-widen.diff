@@ -1,0 +1,21 @@
+# contract-widen.diff — exl3_plain v1 contract widening for the mul1-validated sparkinfer tree.
+# Spec: VALIDATE-RUN.md item 10 / MUL1-FEASIBILITY.md "Validation protocol" step 5
+# ("contract.py SPARKINFER_CODEBOOKS / SPARKINFER_TRELLIS_BITS must be widened in the same
+#  image — a one-line change each, deliberately not made until step 3 passes").
+# APPLY ONLY AFTER validate_mul1.py step c (c_oracle_real_tensors) is PASS with exit 0
+# and out/validate-receipts.json is attached to GATES.md gate 1 / 2b.
+# Apply:  cd <dir containing exl3_plain_sglang_overlay/> && patch -p1 -i contract-widen.diff
+# (Dockerfile.serve applies it to /opt/exl3-plain-overlay and /w2port.)
+--- a/exl3_plain_sglang_overlay/contract.py
++++ b/exl3_plain_sglang_overlay/contract.py
+@@ -25,8 +25,8 @@
+ # them (moe/_shared/kernels/w4a16/prepare.py::_TRELLIS256_CODEBOOK_SENTINELS).
+ CODEBOOK_SENTINELS = {0xCBAC1FED: "mcg", 0x83DCD12D: "mul1"}
+ # What sparkinfer 1.0.1 can actually execute (prepare.py + kernel.py checks).
+-SPARKINFER_CODEBOOKS = frozenset({"mcg"})
+-SPARKINFER_TRELLIS_BITS = frozenset({3, 4, 5, 6})
++SPARKINFER_CODEBOOKS = frozenset({"mcg", "mul1"})
++SPARKINFER_TRELLIS_BITS = frozenset({2, 3, 4, 5, 6})
+ 
+ _EXPERT = re.compile(
+     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."

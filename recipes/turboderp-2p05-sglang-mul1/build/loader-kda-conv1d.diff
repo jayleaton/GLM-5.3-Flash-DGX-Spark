@@ -1,0 +1,70 @@
+--- a/exl3_plain_sglang_overlay/loader.py
++++ b/exl3_plain_sglang_overlay/loader.py
+@@ -10,8 +10,14 @@
+                                       fused (qkv_proj) or concatenated (gate_up_proj, fused q/kv_a);
+   * NEXTN layer 45 tensors         -> dropped while MTP is off, counted;
+   * vision q/k/v trellis           -> dropped in favour of the BF16 fused ``attn.qkv``, counted;
++  * KDA ``self_attn.conv1d.weight`` -> split into ``q_conv1d/k_conv1d/v_conv1d.weight`` thirds: the
++                                      checkpoint carries the fused HF conv over [q|k|v], SGLang's unfused
++                                      KDA path (quant_config set) only maps the three separate names into
++                                      ``qkv_conv1d`` and silently skips the fused one (Gate-2 attempt 9 finding);
+   * everything else                -> stock loader unchanged.
+-Any trellis tensor that reaches the end unrouted aborts the load.
++Any trellis tensor that reaches the end unrouted aborts the load, and so does any non-EXL3 SGLang
++parameter that received no checkpoint tensor from the stock loader (SGLang ``continue``s on names it
++cannot match; a module left at random init is exactly the silent failure this adapter must refuse).
+ """
+ 
+ from __future__ import annotations
+@@ -52,6 +58,16 @@
+                 if source_name.startswith(f"model.language_model.layers.{NEXTN_LAYER}."):
+                     acct.add("dropped:nextn_mtp_off", tensor, 0)
+                     continue
++                if source_name.endswith(".self_attn.conv1d.weight"):
++                    # fused HF KDA short-conv [3P, 1, W] -> the three names SGLang's stacked mapping knows
++                    if tensor.shape[0] % 3:
++                        raise ValueError(f"{source_name}: conv1d rows {tensor.shape[0]} not divisible by 3")
++                    third = tensor.shape[0] // 3
++                    for i, proj in enumerate(("q_conv1d", "k_conv1d", "v_conv1d")):
++                        piece = tensor[i * third:(i + 1) * third].contiguous()
++                        acct.add("bf16:passthrough [kda conv1d split]", piece)
++                        remaining.append((source_name.replace(".self_attn.conv1d.weight", f".self_attn.{proj}.weight"), piece))
++                    continue
+                 acct.add("bf16:passthrough", tensor)
+                 remaining.append((source_name, tensor))
+                 continue
+@@ -98,8 +114,33 @@
+                 del pending[key.module]
+         if pending:
+             raise ValueError(f"incomplete dense EXL3 modules at end of load: {sorted(pending)[:5]}")
+-        result = original(self, remaining, is_nextn=is_nextn)
++        # Completeness: every non-EXL3 SGLang parameter must receive a checkpoint tensor through the stock
++        # loader.  SGLang's load_weights `continue`s on names it cannot map, leaving the module at random init.
++        from sglang.srt.model_loader.weight_utils import default_weight_loader
++        loaded: set[str] = set()
++
++        def _record(pname, param):
++            inner = getattr(param, "weight_loader", None) or default_weight_loader
++
++            def rec(p, *a, **k):
++                loaded.add(pname)
++                return inner(p, *a, **k)
++            param.weight_loader = rec
++            return inner
++
++        originals = {pname: _record(pname, param) for pname, param in params.items() if ".exl3_" not in pname}
++        try:
++            result = original(self, remaining, is_nextn=is_nextn)
++        finally:
++            for pname, inner in originals.items():
++                params[pname].weight_loader = inner
++        missing = sorted(n for n in originals if n not in loaded)
+         log.warning("exl3_plain byte accounting (end of load)\n%s", acct.report())
++        log.warning("exl3_plain: stock loader received %d tensors; %d/%d non-EXL3 parameters loaded, %d missing",
++                    len(remaining), len(originals) - len(missing), len(originals), len(missing))
++        if missing:
++            raise ValueError(f"{len(missing)} SGLang parameters received no checkpoint tensor (would serve random init): "
++                             f"{missing[:40]}{' ...' if len(missing) > 40 else ''}")
+         return result
+     return wrapped
+ 

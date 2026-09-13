@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1.7
+# exl3_plain v1 — Gate-2 SERVING image for 2384 (sm121 / ARM64 / TP1).
+#
+# Base: the mul1-VALIDATED tree.  glm53-flash-sglang-exl3-plain:mul1-validate is
+# glm53-flash-sglang-exl3-plain:v1 (Dockerfile) + patches/000{1,2,3} applied IN PLACE to
+# /sgl-workspace/sglang/python/sparkinfer (pristine copy kept at /opt/sparkinfer-pristine)
+# + exllamav3 v1.4.9 ARM64 oracle.  Serving uses that patched site-packages sparkinfer.
+#
+# Build ONLY after run-step-c.sh exits 0 with c_oracle_real_tensors=PASS
+# (out/validate-receipts.json attached to GATES.md gate 1 / 2b):
+#   cd <repo>/recipes/turboderp-2p05-sglang-mul1/build && docker build -f serve-prep/Dockerfile.serve \
+#       -t glm53-flash-sglang-exl3-plain:serve serve-prep/
+# Build context is serve-prep/ only (the diffs); everything else is already in the base image.
+FROM glm53-flash-sglang-exl3-plain:mul1-validate
+
+ARG APPLY_MOE_MARKER=0
+COPY contract-widen.diff /opt/serve-prep/contract-widen.diff
+COPY moe-mul1-marker.diff /opt/serve-prep/moe-mul1-marker.diff
+COPY fused-linear-fallback.diff /opt/serve-prep/fused-linear-fallback.diff
+COPY kernel-codebook-binding.diff /opt/serve-prep/kernel-codebook-binding.diff
+COPY trellis-graph-storage.diff /opt/serve-prep/trellis-graph-storage.diff
+COPY dtype-fix.diff /opt/serve-prep/dtype-fix.diff
+COPY loader-kda-conv1d.diff /opt/serve-prep/loader-kda-conv1d.diff
+COPY loader-unconsumed-gate.diff /opt/serve-prep/loader-unconsumed-gate.diff
+COPY moe-routed-scaling.diff /opt/serve-prep/moe-routed-scaling.diff
+
+# Step 5 widening (VALIDATE-RUN.md item 10): applied to BOTH overlay copies so the census
+# (/opt/exl3-plain-overlay, on PYTHONPATH at serve time) and the validator tree (/w2port) agree.
+# fused-linear-fallback.diff (2026-09-13, after the Gate-2 first-load failure on 2384, image
+# sha256:a10d5012): fused SGLang linears (QKVParallelLinear qkv_proj; MergedColumnParallelLinear
+# gate_up_proj; ReplicatedLinear fused_qkv_a_proj_with_mqa) take the sanctioned dequant->BF16 path,
+# announced once per class at construction and again at load with the reason, byte-accounted at
+# end-of-load; unfused dense modules (o_proj, q_b_proj, indexer.wq_b, down_proj, lm_head, vision
+# attn.proj / merger.*) stay native trellis.  Expected end-of-load report on the 2.05 mul1 artifact:
+# dense:dequant->bf16 rows sum to ~9.66 GB resident (qkv_proj alone 6.85 GB), dense:native_trellis
+# ~1.91 GB.  The census verdict is unchanged: dense_sparkinfer_native means kernel-capable, not routed.
+# moe-routed-scaling.diff (2026-09-13, Gate-2 residual after the conv1d fix): Exl3MoEMethod.apply passed the
+# UNSCALED top-k weights to sparkinfer; SGLang's CUDA path expects the MoE runner to apply routed_scaling_factor
+# (2.5), so every routed expert ran at 1/2.5 strength (+1.7 nats NLL vs exllamav3, greedy loops).  Verified live:
+# passage NLL 2.80 -> 1.10 (exllamav3 1.10), teacher-forced top-1 79/80, greedy 80 tokens identical to the oracle.
+# loader-unconsumed-gate.diff: converse completeness gate (checkpoint tensors the stock loader drops silently).
+# trellis-graph-storage.diff (2026-09-13, Gate-2 attempt 8): CUDA graph capture died in the native dense
+# path ("Trellis dense output is not initialized for CUDA graph capture"); Exl3LinearMethod now owns
+# every buffer trellis_linear.run needs, sized once to SGLANG_EXL3_MAX_BATCH_TOKENS.  Applied after
+# fused-linear-fallback.diff (its linear.py is the base).
+RUN set -eux; \
+    for root in /opt/exl3-plain-overlay /w2port; do \
+      cd "$root" && patch -p1 --forward -i /opt/serve-prep/contract-widen.diff; \
+      if [ "$APPLY_MOE_MARKER" = "1" ]; then patch -p1 --forward -i /opt/serve-prep/moe-mul1-marker.diff; fi; \
+      patch -p1 --forward -i /opt/serve-prep/fused-linear-fallback.diff; patch -p1 --forward -i /opt/serve-prep/dtype-fix.diff;\
+      patch -p1 --forward -i /opt/serve-prep/trellis-graph-storage.diff; \
+      patch -p1 --forward -i /opt/serve-prep/loader-kda-conv1d.diff; \
+      patch -p1 --forward -i /opt/serve-prep/loader-unconsumed-gate.diff; \
+      patch -p1 --forward -i /opt/serve-prep/moe-routed-scaling.diff; \
+    done
+# kernel-codebook-binding.diff (2026-09-13, Gate-2 attempt 5, image sha256:6c0a275d, APPLY_MOE_MARKER=1):
+# scheduler died at first MoE run with "'W4A16FusedMoeKernel' object has no attribute 'trellis_codebook'".
+# patches/0002 added the parameter and the two self.trellis_codebook reads (fc1/fc2 construction) but
+# never the assignment.  Applied to the SERVING sparkinfer tree (same SP as Dockerfile.mul1).
+RUN set -eux; SP=/sgl-workspace/sglang/python; \
+    cd "$SP" && test -d sparkinfer/moe/_shared/kernels/w4a16 \
+      && patch -p1 --forward -i /opt/serve-prep/kernel-codebook-binding.diff
+ENV PYTHONPATH=/opt/exl3-plain-overlay:/sgl-workspace/sglang/python
+RUN python3 - <<'PY'
+from exl3_plain_sglang_overlay import contract as c
+assert c.SPARKINFER_CODEBOOKS == frozenset({"mcg", "mul1"}), c.SPARKINFER_CODEBOOKS
+assert c.SPARKINFER_TRELLIS_BITS == frozenset({2, 3, 4, 5, 6}), c.SPARKINFER_TRELLIS_BITS
+import sparkinfer._lib.intrinsics as i; assert hasattr(i, "_TRELLIS_MUL1")   # patched (mul1-validated) tree
+import inspect, sparkinfer.moe._shared.kernels.w4a16.kernel as k
+src = inspect.getsource(k.W4A16FusedMoeKernel.__init__)
+assert "self.trellis_codebook = " in src, "kernel-codebook-binding.diff not applied to the serving sparkinfer"
+import exl3_plain_sglang_overlay.linear as lin
+import inspect as _i, exl3_plain_sglang_overlay.moe as _m, exl3_plain_sglang_overlay.loader as _l
+assert "routed_scaling_factor" in _i.getsource(_m.Exl3MoEMethod.apply), "moe-routed-scaling.diff not applied"
+assert hasattr(_l, "_unconsumed"), "loader-unconsumed-gate.diff not applied"
+assert hasattr(lin, "DenseGraphStorage") and lin.MAX_BATCH_TOKENS_ENV == "SGLANG_EXL3_MAX_BATCH_TOKENS", "trellis-graph-storage.diff not applied"
+import sparkinfer.gemm.trellis_linear, sparkinfer.moe.fused_moe, exl3_plain_sglang_overlay.census, exl3_plain_sglang_overlay.exl3_reference
+print("serve image: contract widened, patched sparkinfer present, overlay imports ok")
+PY
+# Widened index-only census must now report the mul1 / 2-bit experts as sparkinfer-native.
+RUN PYTHONPATH=/opt/exl3-plain-overlay:/sgl-workspace/sglang/python python3 -m exl3_plain_sglang_overlay.census \
+      /opt/exl3-plain-overlay/exl3_plain_sglang_overlay/contract/model.safetensors.index.json --index-only \
+      --out /opt/exl3-plain-overlay/census-index-only-widened.json
+
+# Serve-time environment (LAUNCH.md §4).  The census receipt is produced ON 2384 by the :serve
+# image against the real shards (SERVE-2384.md step 3) and mounted at /receipts.
+ENV PYTHONPATH=/opt/exl3-plain-overlay/site:/opt/exl3-plain-overlay:/sgl-workspace/sglang/python \
+    SGLANG_EXL3_MAX_BATCH_TOKENS=256 \
+    EXL3_PLAIN_CENSUS=/receipts/exl3-plain-census-2p05.json \
+    EXL3_PLAIN_DECODER=exl3_plain_sglang_overlay.exl3_reference:decode
+
+EXPOSE 8000
+# TP1 serving entrypoint: exactly the LAUNCH.md §4 flags, port 8000, MTP OFF (no speculative args).
+ENTRYPOINT ["python3", "-m", "sglang.launch_server", \
+    "--model-path", "/model", "--host", "0.0.0.0", "--port", "8000", \
+    "--quantization", "exl3", "--tp-size", "1", "--ep-size", "1", "--context-length", "262144", \
+    "--kv-cache-dtype", "fp8_e4m3", "--attention-backend", "dsa", \
+    "--dsa-prefill-backend", "flashinfer_sparse_mla", "--dsa-decode-backend", "flashinfer_sparse_mla", \
+    "--linear-attn-backend", "triton", "--disable-shared-experts-fusion", \
+    "--chunked-prefill-size", "256", "--max-prefill-tokens", "256", "--max-running-requests", "1", \
+    "--cuda-graph-max-bs-decode", "8", "--cuda-graph-max-bs-prefill", "1", \
+    "--mem-fraction-static", "0.90", "--enable-multimodal", \
+    "--chat-template", "/opt/glm53/chat-template-mm.jinja", \
+    "--reasoning-parser", "glm45", "--tool-call-parser", "glm47"]

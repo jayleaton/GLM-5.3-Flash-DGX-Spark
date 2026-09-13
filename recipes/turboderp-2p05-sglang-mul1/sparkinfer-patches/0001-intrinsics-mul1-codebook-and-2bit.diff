@@ -1,0 +1,204 @@
+diff -u -r a/sparkinfer/_lib/intrinsics.py b/sparkinfer/_lib/intrinsics.py
+--- a/sparkinfer/_lib/intrinsics.py	2026-07-30 07:13:57
++++ b/sparkinfer/_lib/intrinsics.py	2026-09-12 16:19:08
+@@ -6171,6 +6171,17 @@
+ _TRELLIS_MCG = 0xCBAC1FED  # codebook.cuh:39  MCG multiplier (cb==1)
+ _TRELLIS_MASK = 0x8FFF8FFF  # codebook.cuh:41  lop3 operand b
+ _TRELLIS_OR = 0x3B603B60  # codebook.cuh:41  lop3 operand c; immLut 0x6a == (a & b) ^ c
++# MUL1 codebook (exllamav3 codebook.cuh:45-55, cb==2):
++#   x = state16 * 0x83DCD12D (u32 wrap); s = byte0+byte1+byte2+byte3 + 0x6400
++#   (exl3 uses vabsdiff4(x, 0) + acc; dp4a(x, 0x01010101, acc) is the same byte
++#   sum and is native on sm_61+); s is the fp16 bit pattern of 1024+bytesum
++#   (exact: 1024..2044 are fp16 integers); value = fma.f16(s, 1/147.7, -10.39).
++_TRELLIS_MUL1 = 0x83DCD12D  # codebook.cuh:47  MUL1 multiplier (cb==2)
++_TRELLIS_MUL1_ONES = 0x01010101  # dp4a byte-sum operand
++_TRELLIS_MUL1_ACC = 0x00006400  # codebook.cuh:49  fp16 bits of 1024.0
++_TRELLIS_MUL1_KINV = 0x1EEE1EEE  # codebook.cuh:51  fp16 1/147.7, both lanes
++_TRELLIS_MUL1_KBIAS = 0xC931C931  # codebook.cuh:52  fp16 -10.39, both lanes
++_TRELLIS_CODEBOOKS = ("mcg", "mul1")
+ 
+ 
+ def _trellis_mcg_asm_constants(asm: str) -> str:
+@@ -6178,12 +6189,48 @@
+         asm.replace("__MCG__", f"{_TRELLIS_MCG:#010x}")
+         .replace("__MASK__", f"{_TRELLIS_MASK:#010x}")
+         .replace("__OR__", f"{_TRELLIS_OR:#010x}")
++        .replace("__MUL1__", f"{_TRELLIS_MUL1:#010x}")
++        .replace("__ONES__", f"{_TRELLIS_MUL1_ONES:#010x}")
++        .replace("__ACC__", f"{_TRELLIS_MUL1_ACC:#010x}")
++        .replace("__KINV__", f"{_TRELLIS_MUL1_KINV:#010x}")
++        .replace("__KBIAS__", f"{_TRELLIS_MUL1_KBIAS:#010x}")
+     )
+ 
+ 
++def _trellis_codebook_asm(codebook: str) -> tuple[str, str, str]:
++    """(register/constant preamble, per-window decode, fragment pack) PTX for one codebook.
++
++    Both variants leave each window register holding a 16-bit fp16 pattern in
++    the low half (MCG: two halves that are summed; MUL1: one fp16 integer), and
++    pack pairs with prmt 0x5410 so element/lane order is identical.
++    """
++    codebook = str(codebook).lower()
++    if codebook == "mcg":
++        return (
++            "mov.b32 M, __MCG__;",
++            "mul.lo.u32 {w}, {w}, M;  lop3.b32 {w}, {w}, __MASK__, __OR__, 0x6a;",
++            "prmt.b32 lo, {a}, {b}, 0x5410;  prmt.b32 hi, {a}, {b}, 0x7632;  add.rn.f16x2 {o}, lo, hi;",
++        )
++    if codebook == "mul1":
++        return (
++            "mov.b32 M, __MUL1__;  mov.b32 ONES, __ONES__;  mov.b32 ACC, __ACC__;  "
++            "mov.b32 KINV, __KINV__;  mov.b32 KBIAS, __KBIAS__;",
++            "mul.lo.u32 {w}, {w}, M;  dp4a.u32.u32 {w}, {w}, ONES, ACC;",
++            "prmt.b32 lo, {a}, {b}, 0x5410;  fma.rn.f16x2 {o}, lo, KINV, KBIAS;",
++        )
++    raise ValueError(f"unsupported trellis codebook {codebook!r}; expected one of {_TRELLIS_CODEBOOKS}")
++
++
++def _trellis_decode_tail(codebook: str) -> str:
++    pre, dec, pack = _trellis_codebook_asm(codebook)
++    lines = [dec.format(w=f"w{i}") for i in range(8)]
++    lines += [pack.format(a=f"w{2 * i}", b=f"w{2 * i + 1}", o=f"${i}") for i in range(4)]
++    return pre, "\n            ".join(lines)
++
++
+ @dsl_user_op
+ def packed_dequant_trellis_to_half2x4(
+-    win_a, win_b, bits: int = 3, *, loc=None, ip=None
++    win_a, win_b, bits: int = 3, codebook: str = "mcg", *, loc=None, ip=None
+ ):
+     """8 trellis windows -> 4 fp16x2 fragments for one compile-time bitrate.
+ 
+@@ -6199,12 +6246,13 @@
+     whose full eight-weight span can cross three ring words.
+     """
+     bits = int(bits)
+-    if bits not in (3, 4, 5, 6):
+-        raise ValueError(f"unsupported trellis bitrate {bits}; expected 3, 4, 5, or 6")
++    if bits not in (2, 3, 4, 5, 6):
++        raise ValueError(f"unsupported trellis bitrate {bits}; expected 2, 3, 4, 5, or 6")
++    preamble, tail = _trellis_decode_tail(codebook)
+     asm = """
+         {
+-            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
+-            mov.b32 M, __MCG__;
++            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M, ONES, ACC, KINV, KBIAS;
++            __PRE__
+             and.b32 w7, $4, 0xffff;
+             shr.u32 w6, $4, __B1__;  and.b32 w6, w6, 0xffff;
+             shr.u32 w5, $4, __B2__;  and.b32 w5, w5, 0xffff;
+@@ -6213,22 +6261,13 @@
+             shr.u32 w2, $5, __B1__;  and.b32 w2, w2, 0xffff;
+             shr.u32 w1, $5, __B2__;  and.b32 w1, w1, 0xffff;
+             shr.u32 w0, $5, __B3__;  and.b32 w0, w0, 0xffff;
+-            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, __MASK__, __OR__, 0x6a;
+-            prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 $0, lo, hi;
+-            prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 $1, lo, hi;
+-            prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 $2, lo, hi;
+-            prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 $3, lo, hi;
++            __TAIL__
+         }
+         """
+     asm = _trellis_mcg_asm_constants(
+-        asm.replace("__B1__", str(bits))
++        asm.replace("__PRE__", preamble)
++        .replace("__TAIL__", tail)
++        .replace("__B1__", str(bits))
+         .replace("__B2__", str(2 * bits))
+         .replace("__B3__", str(3 * bits))
+     )
+@@ -6255,7 +6294,7 @@
+ 
+ @dsl_user_op
+ def packed_dequant_trellis_stream_to_half2x4(
+-    stream_lo, stream_hi, bits: int, *, loc=None, ip=None
++    stream_lo, stream_hi, bits: int, codebook: str = "mcg", *, loc=None, ip=None
+ ):
+     """Decode eight windows from a bitrate-strided 64-bit aligned stream.
+ 
+@@ -6264,12 +6303,13 @@
+     34 bits and cannot be represented by one 32-bit base window.
+     """
+     bits = int(bits)
+-    if bits not in (3, 4, 5, 6):
+-        raise ValueError(f"unsupported trellis bitrate {bits}; expected 3, 4, 5, or 6")
++    if bits not in (2, 3, 4, 5, 6):
++        raise ValueError(f"unsupported trellis bitrate {bits}; expected 2, 3, 4, 5, or 6")
++    preamble, tail = _trellis_decode_tail(codebook)
+     asm = """
+         {
+-            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
+-            mov.b32 M, __MCG__;
++            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M, ONES, ACC, KINV, KBIAS;
++            __PRE__
+             and.b32 w7, $4, 0xffff;
+             __I6__
+             __I5__
+@@ -6278,18 +6318,7 @@
+             __I2__
+             __I1__
+             __I0__
+-            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, __MASK__, __OR__, 0x6a;
+-            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, __MASK__, __OR__, 0x6a;
+-            prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 $0, lo, hi;
+-            prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 $1, lo, hi;
+-            prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 $2, lo, hi;
+-            prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 $3, lo, hi;
++            __TAIL__
+         }
+         """
+     for name, register, multiple in (
+@@ -6313,7 +6342,7 @@
+                 f"and.b32 {register}, {register}, 0xffff;"
+             )
+         asm = asm.replace(name, instruction)
+-    asm = _trellis_mcg_asm_constants(asm)
++    asm = _trellis_mcg_asm_constants(asm.replace("__PRE__", preamble).replace("__TAIL__", tail))
+     result = llvm.inline_asm(
+         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+         [
+@@ -6369,7 +6398,7 @@
+ 
+ @dsl_user_op
+ def packed_dequant_trellis_to_bfloat2x4(
+-    win_a, win_b, bits: int = 3, *, loc=None, ip=None
++    win_a, win_b, bits: int = 3, codebook: str = "mcg", *, loc=None, ip=None
+ ):
+     """Diagnostic bf16 conversion of the generalized fp16 trellis decode.
+ 
+@@ -6378,7 +6407,7 @@
+     fragment.  This wrapper remains available for the D4 bf16 A/B gate.
+     """
+     h0, h1, h2, h3 = packed_dequant_trellis_to_half2x4(
+-        win_a, win_b, bits, loc=loc, ip=ip
++        win_a, win_b, bits, codebook, loc=loc, ip=ip
+     )
+     return (
+         _f16x2_to_bf16x2(h0, loc=loc, ip=ip),
+@@ -6390,11 +6419,11 @@
+ 
+ @dsl_user_op
+ def packed_dequant_trellis_stream_to_bfloat2x4(
+-    stream_lo, stream_hi, bits: int, *, loc=None, ip=None
++    stream_lo, stream_hi, bits: int, codebook: str = "mcg", *, loc=None, ip=None
+ ):
+     """Diagnostic bf16 conversion of the 64-bit-stream trellis decode."""
+     h0, h1, h2, h3 = packed_dequant_trellis_stream_to_half2x4(
+-        stream_lo, stream_hi, bits, loc=loc, ip=ip
++        stream_lo, stream_hi, bits, codebook, loc=loc, ip=ip
+     )
+     return (
+         _f16x2_to_bf16x2(h0, loc=loc, ip=ip),

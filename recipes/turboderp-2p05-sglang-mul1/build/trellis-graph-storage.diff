@@ -1,0 +1,128 @@
+# trellis-graph-storage.diff — exl3_plain v1: caller-owned storage for the native dense trellis path.
+#
+# Gate-2 failure (2384, attempt 8): CUDA graph capture died at the first dense trellis linear with
+#   RuntimeError: Trellis dense output is not initialized for CUDA graph capture; provide caller-owned storage
+#   (sglang cuda_graph_setup.py:478 -> trellis_linear.run -> kernel.py _trellis_dense_buffer)
+# Attempt 9 runs with --disable-cuda-graph as a stopgap.
+# Cause: Exl3LinearMethod.apply called trellis_linear.run(x, weight) with no storage.  The kernel contract
+# (sparkinfer/gemm/trellis_linear/__init__.py docstring; kernel.py _trellis_dense_buffer and _get_c_tmp)
+# is that NOTHING is allocated under capture: output and gemm_output, the c_tmp GEMM scratch (sized by
+# host.packed_gemm_scratch_elements and re-fetched on EVERY call inside _compile_w4a16_gemm_launch), and
+# for BF16 activations/params the fp16 intermediates input_f16, rotated_f16, rotated_compute,
+# gemm_output_f16, output_f16.  The output buffer alone would not have been enough.
+# Fix (overlay only; no sparkinfer change): DenseGraphStorage, allocated once per dense module in
+# process_weights_after_loading and sized to SGLANG_EXL3_MAX_BATCH_TOKENS — the same cap the MoE method
+# preplans (moe.py), 256 in the serve image (= --chunked-prefill-size).  apply() hands run() leading [:m]
+# views, which stay contiguous and 16-byte aligned since K, N are multiples of 64/128 (kernel checks
+# shape/dtype/device/contiguity/alignment on each).  c_tmp capacity is computed for route_slots =
+# ceil(cap/64)*64 and covers every smaller m (the kernel slices [:elements]).
+# Memory: output is per module (M x N bf16, 1.5 MB at 256x3072); every other buffer is shared across
+# modules with the same (device, M, dim) — apply is synchronous on one stream, so the temporaries are dead
+# before the next module runs — ~14 MB per distinct (K, N) pair.  Nothing is ever freed or regrown:
+# captured graphs bake the addresses in.
+# Behaviour: m <= cap -> storage path (eager and captured alike; the returned tensor IS the module's
+# output buffer, overwritten on its next call — every SGLang consumer of these modules uses the result
+# before the module runs again).  m > cap eagerly (e.g. an unchunked vision tower) -> kernel-allocated
+# path as before.  m > cap under capture -> loud ValueError naming the env var.  Non-BF16 activations
+# -> loud ValueError (create_weights already pins params to BF16).
+# Verified on CPU with sglang/sparkinfer stubbed (scratchpad test_gs.py): all views satisfy the kernel's
+# buffer checks for m in {1,2,7,8,63,64,65,255,256}; c_tmp capacity >= the kernel's requirement for each;
+# apply routes m<=cap through storage and m>cap through the eager call; fp16 input rejected.  Not yet
+# run on 2384: needs a :serve rebuild and a Gate-2 attempt WITHOUT --disable-cuda-graph.
+#
+# Apply AFTER fused-linear-fallback.diff (its linear.py hunks are the base):
+#   cd <dir containing exl3_plain_sglang_overlay/> && patch -p1 --forward -i trellis-graph-storage.diff
+# (Dockerfile.serve applies it to /opt/exl3-plain-overlay and /w2port, in the same loop.)
+--- a/exl3_plain_sglang_overlay/linear.py	2026-09-13 03:42:16
++++ b/exl3_plain_sglang_overlay/linear.py	2026-09-13 03:44:23
+@@ -20,9 +20,64 @@
+ from sglang.srt.layers.quantization.base_config import LinearMethodBase
+ 
+ from .contract import CODEBOOK_SENTINELS
+-from .util import trellis_linear_api
++from .util import positive_env, trellis_linear_api
+ 
++# Same cap the MoE method preplans (moe.py); dense storage is sized to it once, at load.
++MAX_BATCH_TOKENS_ENV = "SGLANG_EXL3_MAX_BATCH_TOKENS"
++_ROUTE_BLOCK = 64  # run_trellis256_dense's moe_block_size; c_tmp capacity is keyed on ceil(M/64)*64
+ 
++# Per-call temporaries shared by every dense module with the same (device, M, dim): apply is
++# synchronous on one stream, so each is dead before the next module runs.  Never freed, never
++# regrown: captured graphs bake these addresses in.
++_SHARED_SCRATCH: dict[tuple, torch.Tensor] = {}
++
++
++def _shared(name: str, shape: tuple[int, int], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
++    key = (name, str(device), tuple(shape), dtype)
++    buf = _SHARED_SCRATCH.get(key)
++    if buf is None:
++        buf = _SHARED_SCRATCH[key] = torch.empty(shape, dtype=dtype, device=device)
++    return buf
++
++
++def _c_tmp_elements(size_n: int, max_tokens: int, device: torch.device) -> int:
++    from sparkinfer.moe._shared.kernels.w4a16.host import packed_gemm_scratch_elements  # what run() sizes c_tmp with
++    route_slots = -(-max_tokens // _ROUTE_BLOCK) * _ROUTE_BLOCK
++    sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
++    return int(packed_gemm_scratch_elements(size_n=size_n, route_slots=route_slots, moe_block_size=_ROUTE_BLOCK, sms=sms))
++
++
++class DenseGraphStorage:
++    """Caller-owned storage for one native dense linear, sized to the preplanned token cap.
++
++    ``run_trellis256_dense`` refuses to allocate under CUDA graph capture (kernel.py
++    ``_trellis_dense_buffer`` / ``_get_c_tmp``): every tensor it would otherwise ``torch.empty``
++    per call is owned here and handed over as a leading ``[:m]`` view, which stays contiguous and
++    16-byte aligned because K and N are multiples of 64/128.  The BF16 activation path needs all
++    of: output, gemm_output, c_tmp, input_f16, rotated_f16, rotated_compute, gemm_output_f16,
++    output_f16.  ``output`` is per module (it is what the caller receives); the rest is shared.
++    """
++
++    def __init__(self, *, in_features: int, out_features: int, max_tokens: int, device: torch.device):
++        self.max_tokens, m, k, n = max_tokens, max_tokens, in_features, out_features
++        self.output = torch.empty((m, n), dtype=torch.bfloat16, device=device)
++        self.gemm_output = _shared("gemm_output", (m, n), torch.bfloat16, device)
++        self.gemm_output_f16 = _shared("gemm_output_f16", (m, n), torch.float16, device)
++        self.output_f16 = _shared("output_f16", (m, n), torch.float16, device)
++        self.input_f16 = _shared("input_f16", (m, k), torch.float16, device)
++        self.rotated_f16 = _shared("rotated_f16", (m, k), torch.float16, device)
++        self.rotated_compute = _shared("rotated_compute", (m, k), torch.bfloat16, device)
++        self.c_tmp = _shared("c_tmp", (_c_tmp_elements(n, m, device),), torch.float32, device)
++
++    def views(self, m: int) -> dict[str, torch.Tensor]:
++        if not 1 <= m <= self.max_tokens:
++            raise ValueError(f"EXL3 dense batch {m} exceeds preplanned {self.max_tokens} tokens")
++        return {"output": self.output[:m], "gemm_output": self.gemm_output[:m], "c_tmp": self.c_tmp,
++                "input_f16": self.input_f16[:m], "rotated_f16": self.rotated_f16[:m],
++                "rotated_compute": self.rotated_compute[:m], "gemm_output_f16": self.gemm_output_f16[:m],
++                "output_f16": self.output_f16[:m]}
++
++
+ class DensePayloadParameter(BasevLLMParameter):
+     def __new__(cls, *, weight_loader, **_: Any):
+         return super().__new__(cls, data=torch.empty(0, dtype=torch.uint8), weight_loader=weight_loader)
+@@ -72,8 +127,22 @@
+         layer.exl3_weight = api.prepare_weight(get("trellis").to(device), get("suh").to(device), get("svh").to(device),
+                                                **{self.codebook: marker}, params_dtype=torch.bfloat16)
+         layer.exl3_api = api
++        layer.exl3_storage = DenseGraphStorage(in_features=self.in_features, out_features=self.out_features,
++                                               max_tokens=positive_env(MAX_BATCH_TOKENS_ENV), device=device)
+ 
+     def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+-        out = layer.exl3_api.run(x.reshape(-1, x.shape[-1]).contiguous(), layer.exl3_weight)
+-        out = out.reshape(*x.shape[:-1], self.out_features).to(torch.bfloat16)
++        if x.dtype != torch.bfloat16:
++            raise ValueError(f"{self.source_module}: exl3_plain dense storage is BF16, got {x.dtype} activations")
++        x2 = x.reshape(-1, x.shape[-1]).contiguous()
++        storage: DenseGraphStorage = layer.exl3_storage
++        m = int(x2.shape[0])
++        if m <= storage.max_tokens:
++            out = layer.exl3_api.run(x2, layer.exl3_weight, **storage.views(m))
++        elif torch.cuda.is_current_stream_capturing():
++            raise ValueError(f"{self.source_module}: EXL3 dense batch {m} exceeds preplanned {storage.max_tokens} "
++                             f"tokens ({MAX_BATCH_TOKENS_ENV}) under CUDA graph capture")
++        else:
++            # Eager only (e.g. an unchunked vision tower above the cap): the kernel allocates per call.
++            out = layer.exl3_api.run(x2, layer.exl3_weight)
++        out = out.reshape(*x.shape[:-1], self.out_features)
+         return out if bias is None else out + bias

@@ -1,0 +1,226 @@
+# fused-linear-fallback.diff — exl3_plain v1: fused SGLang linears take the sanctioned dequant->BF16 path.
+#
+# Gate-2 failure (2384, image :serve sha256:a10d5012, 2026-09-13 06:16 UTC):
+#   ValueError: model.language_model.layers.0.self_attn.qkv_proj: fused SGLang linear cannot take a
+#   native trellis payload        (linear.py:50, Exl3LinearMethod.create_weights, output_partition_sizes=3)
+# Cause: config.get_quant_method chose Exl3LinearMethod from the census verdict alone
+# (dense_sparkinfer_native = kernel-capable); QKVParallelLinear owns one weight for q/k/v and
+# loads by shard, which a native trellis payload cannot do.  Two further latent failures of the same
+# shape were found while tracing: (1) q_a_proj / kv_a_proj_with_mqa are census-native but SGLang
+# concatenates them into fused_qkv_a_proj_with_mqa, so the loader would raise "EXL3 dense target
+# missing"; (2) vision prefixes ("visual.x") never mapped to their census module ("model.visual.x"),
+# so vision attn.proj / mlp.down_proj / merger.* would have hit the same missing-target error.
+#
+# Change (config.py, loader.py, linear.py; dequant.py unchanged):
+#   * get_quant_method: a native-capable source whose SGLang consumer is FUSED (len(layer.output_sizes) > 1,
+#     the same predicate ColumnParallelLinear uses; set before LinearBase.__init__ by QKVParallelLinear and
+#     MergedColumnParallelLinear) is ANNOUNCED once per (SGLang class <- source class) and routed to
+#     UnquantizedLinearMethod; the config records it in fallback_bound.  Unfused consumers bind
+#     Exl3LinearMethod and are recorded in native_bound (source -> SGLang prefix).
+#   * loader: routes by config.native_bound (what was actually constructed), not by the census verdict;
+#     everything else DENSE takes the sanctioned dequant path with the reason in the per-class log line;
+#     byte accounting unchanged (resident = N*K*2 per dequantized module; every tensor in one row).
+#   * source_module: adds the "visual." -> "model.visual." candidate so unfused vision modules stay native.
+#   * linear.py: fused check kept as an unreachable routing-bug guard; message says so.
+# Result on the 2.05 mul1 artifact: native trellis = o_proj x46, q_b_proj x12, indexer.wq_b x12,
+# mlp.down_proj x3, shared_experts.down_proj x43, lm_head, vision attn.proj x24, vision mlp.down_proj x24,
+# merger.proj, merger.down_proj.  Dequant->BF16 = qkv_proj x34, q_a_proj x12, kv_a_proj_with_mqa x12,
+# mlp.gate/up_proj x3+3, shared_experts.gate/up_proj x43+43, vision mlp.gate/up x24+24, merger gate/up.
+# Verified: py_compile; stub-routing test over the real census receipt (14 SGLang module cases, 16-module
+# synthetic load stream, byte report printed).  NOT yet run on GPU.
+# Apply (after contract-widen.diff and moe-mul1-marker.diff; no overlapping hunks):
+#   cd <dir containing exl3_plain_sglang_overlay/> && patch -p1 -i fused-linear-fallback.diff
+diff --color -ru a/exl3_plain_sglang_overlay/config.py b/exl3_plain_sglang_overlay/config.py
+--- a/exl3_plain_sglang_overlay/config.py	2026-09-13 02:22:38
++++ b/exl3_plain_sglang_overlay/config.py	2026-09-13 02:22:43
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import os
+ import re
+ from pathlib import Path
+@@ -18,6 +19,7 @@
+ from .contract import FIRST_MOE_LAYER, LAST_MOE_LAYER, SOURCE_PREFIX, STRIPPED_PREFIX
+ 
+ CENSUS_ENV = "EXL3_PLAIN_CENSUS"
++log = logging.getLogger("exl3_plain")
+ _MOE_PREFIX = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.experts$")
+ 
+ 
+@@ -57,7 +59,13 @@
+         self.census = _load_census()
+         if self.codebook and self.census["codebook"] != self.codebook:
+             raise ValueError(f"quantization_config codebook={self.codebook!r} but census found {self.census['codebook']!r}")
++        # census verdict: which DENSE modules sparkinfer's kernel *could* run natively
+         self.dense_native = self.census["verdict"]["dense_sparkinfer_native"]
++        # construction-time routing, filled by get_quant_method(); the loader keys on these,
++        # never on dense_native alone (the SGLang consumer may be fused: see get_quant_method)
++        self.native_bound: dict[str, str] = {}     # source module -> SGLang prefix holding the payload params
++        self.fallback_bound: dict[str, str] = {}   # source module -> reason it takes the sanctioned path
++        self._announced: set[str] = set()
+ 
+     # --- QuantizationConfig ----------------------------------------------------
+     def get_name(self) -> str:
+@@ -90,11 +98,22 @@
+     # --- routing -----------------------------------------------------------------
+     def source_module(self, prefix: str) -> str | None:
+         """Map an SGLang module prefix to the checkpoint module that feeds it, if any."""
+-        for candidate in (prefix, prefix.replace(STRIPPED_PREFIX, SOURCE_PREFIX, 1)):
++        # text stack: "model.layers.N.x" -> "model.language_model.layers.N.x"; vision: "visual.x" -> "model.visual.x"
++        for candidate in (prefix, prefix.replace(STRIPPED_PREFIX, SOURCE_PREFIX, 1), STRIPPED_PREFIX + prefix):
+             if candidate in self.census["dense"]:
+                 return candidate
+         return None
+ 
++    def dense_route(self, source: str) -> str:
++        """Final routing for one checkpoint DENSE module, valid once the model is constructed."""
++        if source in self.native_bound:
++            return "native"
++        if source in self.fallback_bound:
++            return self.fallback_bound[source]
++        if not self.dense_native.get(source):
++            return "census: not sparkinfer-native"
++        return "consumer unbound: SGLang fuses/concatenates this module (no native payload parameter exists)"
++
+     def get_quant_method(self, layer: nn.Module, prefix: str):
+         if layer.__class__.__name__ == "FusedMoE":
+             match = _MOE_PREFIX.search(prefix)
+@@ -105,11 +124,40 @@
+         if isinstance(layer, LinearBase) or layer.__class__.__name__ == "ParallelLMHead":
+             source = self.source_module(prefix)
+             if source is not None and self.dense_native.get(source):
++                # A fused SGLang linear (QKVParallelLinear, MergedColumnParallelLinear, ...)
++                # owns one weight for several logical projections and loads by shard; a native
++                # trellis payload cannot be split that way.  Fused consumers take the sanctioned
++                # dequant->BF16 path even when the kernel could run the module natively.
++                # Same predicate ColumnParallelLinear uses to build output_partition_sizes.
++                output_sizes = getattr(layer, "output_sizes", None)
++                if output_sizes is not None and len(output_sizes) > 1:
++                    sgl_cls, src_cls = layer.__class__.__name__, _module_class(source)
++                    key = f"{sgl_cls}<-{src_cls}"
++                    if key not in self._announced:
++                        self._announced.add(key)
++                        log.warning("exl3_plain: %s (output_sizes=%s) at %r is a fused SGLang linear; DENSE source class %s "
++                                    "takes the sanctioned dequant->BF16 path (sparkinfer-native capable, consumer fused)",
++                                    sgl_cls, list(output_sizes), prefix, src_cls)
++                    self.fallback_bound[source] = f"consumer fused: {sgl_cls} output_sizes={list(output_sizes)}"
++                    return UnquantizedLinearMethod()
++                if source in self.native_bound:
++                    raise ValueError(f"{source}: native EXL3 payload already bound to {self.native_bound[source]!r}")
+                 from .linear import Exl3LinearMethod
++                self.native_bound[source] = prefix
+                 return Exl3LinearMethod(self, source)
+-            # Fused SGLang modules (gate_up_proj, fused q/kv_a, vision qkv) and every
+-            # module sparkinfer cannot decode natively take the sanctioned path: the
+-            # loader dequantizes DENSE trellis tensors to BF16 and hands them to the
+-            # stock weight loader.  Experts never take this path (see moe.py).
++            # Modules SGLang fuses by concatenation (gate_up_proj, fused_qkv_a_proj_with_mqa) have
++            # no census source of their own; they and every module sparkinfer cannot decode
++            # natively take the sanctioned path: the loader dequantizes DENSE trellis tensors to
++            # BF16 and hands them to the stock weight loader.  Experts never take this path (moe.py).
+             return UnquantizedLinearMethod()
+         return None
++
++
++def _module_class(module: str) -> str:
++    """Checkpoint module -> class label used in announcements and the byte report (layer index dropped)."""
++    if module == "lm_head":
++        return "lm_head"
++    if module.startswith("model.visual"):
++        return "vision." + module.split(".")[-1]
++    parts = module.split(".")
++    return ".".join(parts[4:]) if len(parts) > 4 else module
+diff --color -ru a/exl3_plain_sglang_overlay/linear.py b/exl3_plain_sglang_overlay/linear.py
+--- a/exl3_plain_sglang_overlay/linear.py	2026-09-13 02:22:38
++++ b/exl3_plain_sglang_overlay/linear.py	2026-09-13 02:22:43
+@@ -1,10 +1,12 @@
+ """``Exl3LinearMethod``: one dense EXL3 linear on sparkinfer's native trellis GEMM.
+ 
+ Selected by ``Exl3PlainConfig`` only for modules the census marks
+-``dense_sparkinfer_native`` (MCG codebook, 3--6 bits, K and N divisible by
+-128, unfused in SGLang).  Everything else takes the dequantize-on-load path in
+-``loader.py``.  On the mul1 artifacts this class is never selected; it exists
+-so an MCG-quantized branch serves its dense modules without dequantization.
++``dense_sparkinfer_native`` (codebook and bits the patched sparkinfer executes, K and
++N divisible by 128) AND whose SGLang consumer is unfused (o_proj, q_b_proj,
++indexer.wq_b, down_proj, lm_head, vision attn.proj / merger.proj).  Fused consumers
++(qkv_proj) and concatenated ones (gate_up_proj, fused_qkv_a_proj_with_mqa) take the
++dequantize-on-load path in ``loader.py``; ``config.get_quant_method`` routes them
++there, so the fused check below is a routing-bug guard, not a reachable path.
+ """
+ 
+ from __future__ import annotations
+@@ -47,7 +49,9 @@
+     def create_weights(self, layer: nn.Module, input_size_per_partition: int, output_partition_sizes: list[int],
+                        input_size: int, output_size: int, params_dtype: torch.dtype, **extra: Any) -> None:
+         if len(output_partition_sizes) != 1:
+-            raise ValueError(f"{self.source_module}: fused SGLang linear cannot take a native trellis payload")
++            raise ValueError(f"{self.source_module}: fused SGLang linear cannot take a native trellis payload "
++                             f"(output_partition_sizes={output_partition_sizes}); config.get_quant_method should have "
++                             "routed this consumer to the sanctioned dequant path")
+         if (input_size_per_partition, output_partition_sizes[0]) != (self.in_features, self.out_features):
+             raise ValueError(f"{self.source_module}: SGLang expects {input_size_per_partition}x{output_partition_sizes[0]}, "
+                              f"checkpoint is {self.in_features}x{self.out_features}")
+diff --color -ru a/exl3_plain_sglang_overlay/loader.py b/exl3_plain_sglang_overlay/loader.py
+--- a/exl3_plain_sglang_overlay/loader.py	2026-09-13 02:22:38
++++ b/exl3_plain_sglang_overlay/loader.py	2026-09-13 02:22:43
+@@ -2,9 +2,12 @@
+ 
+ Routing by field suffix after the ``model.language_model.`` strip:
+   * routed experts (layers 3--44)  -> ``Exl3MoEMethod`` payload parameters;
+-  * native dense modules           -> ``Exl3LinearMethod`` payload parameters;
++  * native dense modules           -> ``Exl3LinearMethod`` payload parameters (only modules the
++                                      config actually bound at construction: unfused SGLang consumers);
+   * all other dense trellis        -> decoded to BF16 ``<module>.weight`` and handed to
+-                                      the stock loader (sanctioned fallback, dense only);
++                                      the stock loader (sanctioned fallback, dense only): modules the
++                                      kernel cannot run natively AND modules whose SGLang consumer is
++                                      fused (qkv_proj) or concatenated (gate_up_proj, fused q/kv_a);
+   * NEXTN layer 45 tensors         -> dropped while MTP is off, counted;
+   * vision q/k/v trellis           -> dropped in favour of the BF16 fused ``attn.qkv``, counted;
+   * everything else                -> stock loader unchanged.
+@@ -21,7 +24,8 @@
+ 
+ from sglang.srt.runtime_context import get_parallel
+ 
+-from .contract import EXPERTS, FIRST_MOE_LAYER, LAST_MOE_LAYER, NEXTN_LAYER, is_vision_qkv_duplicate, parse, strip_prefix
++from .config import _module_class
++from .contract import EXPERTS, FIRST_MOE_LAYER, LAST_MOE_LAYER, NEXTN_LAYER, is_vision_qkv_duplicate, parse
+ from .dequant import ByteAccount, dequantize, resolve_decoder
+ 
+ log = logging.getLogger("exl3_plain")
+@@ -68,8 +72,8 @@
+             if is_vision_qkv_duplicate(source_name):
+                 acct.add("dropped:vision_qkv_duplicate", tensor, 0)
+                 continue
+-            if config.dense_native.get(key.module):
+-                target = f"{strip_prefix(key.module)}.exl3_{key.field}"
++            if key.module in config.native_bound:
++                target = f"{config.native_bound[key.module]}.exl3_{key.field}"
+                 param = params.get(target)
+                 if param is None:
+                     raise ValueError(f"EXL3 dense target missing: {target}")
+@@ -84,7 +88,8 @@
+                 weight = dequantize(decoder, key.module, bucket, codebook)
+                 cls = _module_class(key.module)
+                 if cls not in logged:
+-                    log.warning("exl3_plain: dequantizing DENSE module class %s to BF16 (sanctioned fallback)", cls)
++                    log.warning("exl3_plain: dequantizing DENSE module class %s to BF16 (sanctioned fallback; reason: %s)",
++                                cls, config.dense_route(key.module))
+                     logged.add(cls)
+                 for t in bucket.values():
+                     acct.add(f"dense:dequant->bf16 [{cls}]", t, 0)
+@@ -105,11 +110,3 @@
+         raise ValueError("exl3_plain loader invoked without Exl3PlainConfig")
+     return cfg
+ 
+-
+-def _module_class(module: str) -> str:
+-    if module == "lm_head":
+-        return "lm_head"
+-    if module.startswith("model.visual"):
+-        return "vision." + module.split(".")[-1]
+-    parts = module.split(".")
+-    return ".".join(parts[4:]) if len(parts) > 4 else module

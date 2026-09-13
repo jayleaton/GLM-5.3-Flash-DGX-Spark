@@ -1,0 +1,26 @@
+--- a/exl3_plain_sglang_overlay/moe.py
++++ b/exl3_plain_sglang_overlay/moe.py
+@@ -123,6 +123,22 @@
+         x, topk = dispatch_output.hidden_states, dispatch_output.topk_output
+         if x.ndim != 2 or x.shape[0] > layer.exl3_max_batch_tokens:
+             raise ValueError(f"EXL3 batch {tuple(x.shape)} exceeds preplanned {layer.exl3_max_batch_tokens} tokens")
++        # routed_scaling_factor contract (SGLang, CUDA path): TopK returns the normalised top-k weights UNSCALED
++        # (apply_routed_scaling_factor_on_output only when the quant method is in FusedMoE's fused-in-topk list),
++        # DeepseekV2MoE.forward_normal treats the runner output as scale-final (maybe_fuse_routed_scale_and_shared_add
++        # just adds the shared output), and every stock runner multiplies the routed sum by
++        # moe_runner_config.routed_scaling_factor (fused_moe.py moe_sum_reduce / flashinfer_cutlass / triton_kernels).
++        # Gate-2 residual finding (2026-09-13): this method passed the raw weights to sparkinfer, so the routed experts
++        # of all 43 MoE layers contributed at 1/routed_scaling_factor (= 1/2.5) strength: coherent text, +1.7 nats NLL
++        # vs exllamav3 on the same checkpoint, greedy repetition loops.  Folding the factor into the per-token weights
++        # is exactly the runner's moe_sum_reduce(out, routed_scaling_factor) since the kernel is linear in them.
++        weights = topk.topk_weights.float()
++        cfg = self.moe_runner_config
++        if getattr(cfg, "apply_router_weight_on_input", False) or getattr(cfg, "no_combine", False):
++            raise ValueError("exl3_plain MoE: apply_router_weight_on_input / no_combine are not supported")
++        scale = getattr(cfg, "routed_scaling_factor", None)
++        if scale is not None and scale != 1.0 and not getattr(layer, "should_fuse_routed_scaling_factor_in_topk", False):
++            weights = weights * scale
+         binding = layer.exl3_api.bind(layer.exl3_plan, scratch=layer.exl3_scratch, a=x.contiguous(), experts=layer.exl3_weights,
+-                                      topk_weights=topk.topk_weights.float().contiguous(), topk_ids=topk.topk_ids.long().contiguous())
++                                      topk_weights=weights.contiguous(), topk_ids=topk.topk_ids.long().contiguous())
+         return StandardCombineInput(hidden_states=layer.exl3_api.run(binding=binding).to(torch.bfloat16))

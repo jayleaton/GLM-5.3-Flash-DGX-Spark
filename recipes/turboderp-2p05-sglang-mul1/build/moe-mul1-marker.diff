@@ -1,0 +1,17 @@
+# moe-mul1-marker.diff — OPTIONAL, NOT applied by Dockerfile.serve unless --build-arg APPLY_MOE_MARKER=1.
+# Finding (2026-09-12, serve-prep): moe.py hard-codes `trellis_mcg=marker` in prepare_weights, so on a
+# mul1 artifact the widened census verdict flips to native but the MoE method would still hand the
+# 0x83DCD12D mul1 marker to the mcg keyword; patched sparkinfer (patches/0003) rejects that marker for
+# mcg. Serving a mul1 artifact needs the keyword to follow the census codebook. This is the minimal
+# change; it is outside the two-line contract widening and must be reviewed/decided before use.
+--- a/exl3_plain_sglang_overlay/moe.py
++++ b/exl3_plain_sglang_overlay/moe.py
+@@ -111,7 +111,7 @@
+         layer.exl3_weights = api.prepare_weights(
+             plan=plan, params_dtype=torch.bfloat16, w1_fp4=w13, w2_fp4=w2, gate_suh=gate_suh, up_suh=up_suh,
+             intermediate_rotations=torch.cat((gate_svh, up_svh, down_suh), dim=1).contiguous(),
+-            down_svh=down_svh, trellis_mcg=marker)
++            down_svh=down_svh, **{"trellis_" + self.codebook: marker})
+         caps = api.Caps(max_tokens=layer.exl3_max_batch_tokens, num_topk=TOP_K, route_num_experts=0, device=device,
+                         weight_plan=layer.exl3_weights.plan, quant_mode="w4a16", w4a16_block_size_m=64)
+         layer.exl3_plan = api.plan(caps)
