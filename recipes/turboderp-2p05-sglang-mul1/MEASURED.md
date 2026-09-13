@@ -49,7 +49,15 @@ buried code, CHARLIE-59→CHARLIE-19).
 retrieved correctly with `finish_reason: stop`. Prefill ≈ 425 tok/s at that
 length on one GB10 (no CUDA graphs; graph cells pending).
 
+## Published image
+
+`ghcr.io/0xsero/glm53-flash-exl3-plain@sha256:85cb3fa86d31a781b94dcf10ee168adf096cfeaac14d2f1e6c560504e58e4eed`
+(tag `2p05-sglang-mul1-r1`, linux/arm64, 31.8 GB). Built from this repo's
+`build/Dockerfile.serve` on the target hardware; serving flags in the image
+ENTRYPOINT (context 262,144, FP8 KV, DSA/KDA attention, multimodal on, CUDA
+decode graphs, MTP off).
+
 ## Not claimed
 
-Vision/video acceptance (tower loads; case triage in progress). MTP/speculative
+Vision/video acceptance: 6/6 synthetic paired visual cases pass (scoped acceptance only, not broad visual quality). Full vision status: the 2.05 recipe serves images and video end-to-end. MTP/speculative
 decoding. Speed-cell benchmarks (pending). Any panel besides the frozen one.
