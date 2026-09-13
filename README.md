@@ -51,6 +51,10 @@ Every claim has a receipt in [`recipes/turboderp-2p05-sglang-mul1/MEASURED.md`](
 
 **Not yet claimed:** MTP/speculative decoding, speed benchmarks with CUDA graphs, full vision evaluation.
 
+## Why not prune a bigger model instead?
+
+We tested this. Taking the 3bpw variant and removing the 25% least-important experts (ranked by routing mass) to fit the same ~90 GB budget produced a **worse** model: 66.8% top-1 / KL 0.905 vs the 2bpw unpruned at 78.9% / 0.384. You can't remove a quarter of the experts and compensate with more precision per survivor. At equal bytes, keep all experts and compress harder.
+
 ## How Recipe A works
 
 The stock kernels couldn't run this model. Three things were built and validated:
