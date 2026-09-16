@@ -92,7 +92,7 @@ ENV PYTHONPATH=/opt/exl3-plain-overlay/site:/opt/exl3-plain-overlay:/sgl-workspa
 EXPOSE 8000
 # TP1 serving entrypoint: exactly the LAUNCH.md §4 flags, port 8000, MTP OFF (no speculative args).
 # Prefill chunk 1024 (was 256; measured 2026-09-16): a cold 79,096-token prompt prefills at
-# 389 tok/s at 256 and 1,287 tok/s at 1024 on one GB10 (3.3x, no cache reuse) — see MEASURED.md.
+# 389 tok/s at 256 and 594 tok/s at 1024 on one GB10 (~1.5x, no cache reuse) — see MEASURED.md.
 # 1024 is the ceiling: at 2048 the dense DenseGraphStorage preplan plus activations exhaust the
 # unified pool and the host OOMs, so keep SGLANG_EXL3_MAX_BATCH_TOKENS == --chunked-prefill-size.
 ENTRYPOINT ["python3", "-m", "sglang.launch_server", \

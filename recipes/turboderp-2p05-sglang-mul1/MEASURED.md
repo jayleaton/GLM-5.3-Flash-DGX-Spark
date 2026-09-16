@@ -59,9 +59,14 @@ length on one GB10 (no CUDA graphs; graph cells pending).
 | chunk | prompt tok | elapsed | prefill tok/s |
 |---|---|---|---|
 | 256 (prior) | 79,096 | 203.2 s | 389 |
-| **1024** | **79,096** | **61.5 s** | **1,287** |
+| **1024** | **79,096** | **133.2 s** | **594** |
 
-3.3× on a cold prefill; steady-state step rate ~600–900 tok/s under load.
+≈1.5× on a cold prefill. Cross-checks: an isolated cache-cold 39,828-token
+prompt at 1024 = 76.1 s (523 tok/s), and a live ~190k agent prefill = ~555
+tok/s. Step time grows with chunk size (256 tok/≈0.8 s → 1024 tok/≈1.9 s), so
+the win is sub-linear in chunk size. (An early 1024 run showed 61.5 s; it was
+not reproducible and is treated as an outlier.)
+
 1024 is the ceiling: 2048 exhausts the unified pool during `DenseGraphStorage`
 preplan + activation peak and OOMs the host. Decode throughput is unchanged
 (~9 tok/s at ~190k context) and is context-bound.
