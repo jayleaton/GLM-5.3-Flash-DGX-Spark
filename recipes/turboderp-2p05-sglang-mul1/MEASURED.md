@@ -61,3 +61,34 @@ decode graphs, MTP off).
 
 Vision/video acceptance: 6/6 synthetic paired visual cases pass (scoped acceptance only, not broad visual quality). Full vision status: the 2.05 recipe serves images and video end-to-end. MTP/speculative
 decoding. Speed-cell benchmarks (pending). Any panel besides the frozen one.
+
+### Serving note — tool-call reliability (2026-09-16)
+
+At the shipped `generation_config.json` temperature (1.0) this 2.05 bpw checkpoint intermittently
+emits malformed GLM tool-call markup, worst when a large tool surface is advertised (opencode
+advertises ~16 tools) and/or after long reasoning. Observed forms: the reasoning tail glued to the
+tool **name** (`... </think><tool_call>bash`), speculative multi-call spam with invented names
+(`bashCommand`), and truncated JSON arguments.
+
+Measured on one GB10 with an opencode-shaped 16-tool harness (streaming), 120 samples per cell:
+
+| temperature | corruption |
+|---|---|
+| 1.0 | 5/120 (4.2%) |
+| 0.6 | 1/120 (0.8%) |
+| 0.0 | 0/120 |
+
+Long-reasoning cases were worse at 1.0 (3/20) and clean at 0.6 (0/20). Lowering the default
+temperature cuts the rate ~5× and is the recommended mitigation.
+
+Because `generation_config.json` ships inside the mounted weights, apply it by bind-mounting an
+override over the model file, e.g.:
+
+```yaml
+volumes:
+  - /path/to/generation_config.override.json:/model/generation_config.json:ro
+```
+
+Two parser notes: `--tool-call-parser` **must stay `glm47`** — `glm45` (which the chat template
+auto-detects) extracts zero tool calls for this model. The reasoning parser staying `glm45` is fine;
+switching it to `deepseek-r1` made no measurable difference.
