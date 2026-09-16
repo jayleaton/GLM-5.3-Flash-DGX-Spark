@@ -85,19 +85,23 @@ RUN PYTHONPATH=/opt/exl3-plain-overlay:/sgl-workspace/sglang/python python3 -m e
 # Serve-time environment (LAUNCH.md §4).  The census receipt is produced ON 2384 by the :serve
 # image against the real shards (SERVE-2384.md step 3) and mounted at /receipts.
 ENV PYTHONPATH=/opt/exl3-plain-overlay/site:/opt/exl3-plain-overlay:/sgl-workspace/sglang/python \
-    SGLANG_EXL3_MAX_BATCH_TOKENS=256 \
+    SGLANG_EXL3_MAX_BATCH_TOKENS=1024 \
     EXL3_PLAIN_CENSUS=/receipts/exl3-plain-census-2p05.json \
     EXL3_PLAIN_DECODER=exl3_plain_sglang_overlay.exl3_reference:decode
 
 EXPOSE 8000
 # TP1 serving entrypoint: exactly the LAUNCH.md §4 flags, port 8000, MTP OFF (no speculative args).
+# Prefill chunk 1024 (was 256; measured 2026-09-16): a cold 79,096-token prompt prefills at
+# 389 tok/s at 256 and 1,287 tok/s at 1024 on one GB10 (3.3x, no cache reuse) — see MEASURED.md.
+# 1024 is the ceiling: at 2048 the dense DenseGraphStorage preplan plus activations exhaust the
+# unified pool and the host OOMs, so keep SGLANG_EXL3_MAX_BATCH_TOKENS == --chunked-prefill-size.
 ENTRYPOINT ["python3", "-m", "sglang.launch_server", \
     "--model-path", "/model", "--host", "0.0.0.0", "--port", "8000", \
     "--quantization", "exl3", "--tp-size", "1", "--ep-size", "1", "--context-length", "262144", \
     "--kv-cache-dtype", "fp8_e4m3", "--attention-backend", "dsa", \
     "--dsa-prefill-backend", "flashinfer_sparse_mla", "--dsa-decode-backend", "flashinfer_sparse_mla", \
     "--linear-attn-backend", "triton", "--disable-shared-experts-fusion", \
-    "--chunked-prefill-size", "256", "--max-prefill-tokens", "256", "--max-running-requests", "1", \
+    "--chunked-prefill-size", "1024", "--max-prefill-tokens", "1024", "--max-running-requests", "1", \
     "--cuda-graph-max-bs-decode", "8", "--cuda-graph-max-bs-prefill", "1", \
     "--mem-fraction-static", "0.90", "--enable-multimodal", \
     "--chat-template", "/opt/glm53/chat-template-mm.jinja", \

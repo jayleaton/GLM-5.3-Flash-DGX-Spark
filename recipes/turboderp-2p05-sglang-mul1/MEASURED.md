@@ -49,6 +49,23 @@ buried code, CHARLIE-59→CHARLIE-19).
 retrieved correctly with `finish_reason: stop`. Prefill ≈ 425 tok/s at that
 length on one GB10 (no CUDA graphs; graph cells pending).
 
+### Prefill chunk tuning (2026-09-16)
+
+`--chunked-prefill-size` / `--max-prefill-tokens` were raised 256 → 1024 with
+`SGLANG_EXL3_MAX_BATCH_TOKENS` kept equal to the chunk (the trellis
+`DenseGraphStorage` is preplanned to that cap). Method: one cache-cold
+79,096-token prompt, `max_tokens=1`, wall-clock to response.
+
+| chunk | prompt tok | elapsed | prefill tok/s |
+|---|---|---|---|
+| 256 (prior) | 79,096 | 203.2 s | 389 |
+| **1024** | **79,096** | **61.5 s** | **1,287** |
+
+3.3× on a cold prefill; steady-state step rate ~600–900 tok/s under load.
+1024 is the ceiling: 2048 exhausts the unified pool during `DenseGraphStorage`
+preplan + activation peak and OOMs the host. Decode throughput is unchanged
+(~9 tok/s at ~190k context) and is context-bound.
+
 ## Published image
 
 `ghcr.io/0xsero/glm53-flash-exl3-plain@sha256:85cb3fa86d31a781b94dcf10ee168adf096cfeaac14d2f1e6c560504e58e4eed`

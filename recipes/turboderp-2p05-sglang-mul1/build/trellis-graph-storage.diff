@@ -12,7 +12,7 @@
 # gemm_output_f16, output_f16.  The output buffer alone would not have been enough.
 # Fix (overlay only; no sparkinfer change): DenseGraphStorage, allocated once per dense module in
 # process_weights_after_loading and sized to SGLANG_EXL3_MAX_BATCH_TOKENS — the same cap the MoE method
-# preplans (moe.py), 256 in the serve image (= --chunked-prefill-size).  apply() hands run() leading [:m]
+# preplans (moe.py), 1024 in the serve image (= --chunked-prefill-size).  apply() hands run() leading [:m]
 # views, which stay contiguous and 16-byte aligned since K, N are multiples of 64/128 (kernel checks
 # shape/dtype/device/contiguity/alignment on each).  c_tmp capacity is computed for route_slots =
 # ceil(cap/64)*64 and covers every smaller m (the kernel slices [:elements]).

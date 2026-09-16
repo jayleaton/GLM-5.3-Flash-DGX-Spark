@@ -26,7 +26,7 @@ adapter's message — that is a pass for the *check*, a fail for the *gate*.
 ## Gate 3 — CUDA graphs
 - [ ] Decode graphs captured for bs ladder ≤ 8 (`--cuda-graph-max-bs-decode 8`); prefill graph bs=1 only (`--cuda-graph-max-bs-prefill 1`). Log shows capture count and no `KernelResolutionFrozenError` after `freeze_kernel_resolution` if enabled.
 - [ ] Replay check: same prompt twice, identical token IDs.
-- [ ] A 257-token prefill chunk is refused loudly (batch > `SGLANG_EXL3_MAX_BATCH_TOKENS`), never silently split into eager.
+- [ ] A 1025-token prefill chunk is refused loudly (batch > `SGLANG_EXL3_MAX_BATCH_TOKENS`), never silently split into eager.
 
 ## Gate 4 — endpoint
 - [ ] `GET /v1/models` → 200 with the model id.
